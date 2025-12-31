@@ -1,0 +1,45 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =========================
+# Install build tools
+# =========================
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    make \
+    cmake \
+    gdb \
+    git \
+    pkg-config \
+    \
+    # C++ libraries
+    libmodbus-dev \
+    libjsoncpp-dev \
+    \
+    && rm -rf /var/lib/apt/lists/*
+
+# RUN git clone --depth=1 https://github.com/yhirose/cpp-httplib.git /tmp/cpp-httplib && \
+#     cp /tmp/cpp-httplib/httplib.h /usr/local/include/ && \
+#     rm -rf /tmp/cpp-httplib
+
+# EXPOSE 9000
+# EXPOSE 9001    
+# =========================
+# Working directory
+# =========================
+WORKDIR /app
+
+# Copy toàn bộ source
+# COPY . .
+
+# Build library
+# RUN cmake -S source -B build && \
+#     cmake --build build && \
+#     cmake --install build --prefix /usr/local
+
+# =========================
+# Default command
+# =========================
+CMD ["/bin/bash"]

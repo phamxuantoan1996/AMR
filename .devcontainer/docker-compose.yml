@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  amr:
+    image: amr:dev # ten image
+    build:
+      context: ..
+      dockerfile: Dockerfile.dev # ten Docker file
+
+    container_name: amr # ten container
+
+    volumes:
+      - ..:/app   # ⭐ RẤT QUAN TRỌNG
+
+    working_dir: /app
+    
+    env_file:
+      - .env.dev # ten file cau hinh env
+
+    # privileged: true # dung cho dev
+    # devices:
+    #   - /dev/CH340:/dev/CH340 # dung cho prod
+    # group_add:
+    #   - dialout
+
+    # ports:
+    #   - "9000:9000" # setup port
+    #   - "9001:9001" 
+
+    tty: true
+    stdin_open: true
+
+    networks:
+      - app_net
+
+    restart: unless-stopped
+
+networks:
+  app_net:
+    driver: bridge

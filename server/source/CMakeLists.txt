@@ -7,11 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Paths
 set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/../include)
-# set(INCLUDE_COMMON_DIR ${PROJECT_SOURCE_DIR}/../../include_common)
+set(INCLUDE_COMMON_DIR ${PROJECT_SOURCE_DIR}/../../common)
 set(LIBRARY_DIR ${PROJECT_SOURCE_DIR}/../library)
 set(SOURCE_DIR ${PROJECT_SOURCE_DIR})
 
 # Include headers
+include_directories(${INCLUDE_COMMON_DIR})
 include_directories(${INCLUDE_DIR})
 
 # Create executable

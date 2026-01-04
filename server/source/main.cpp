@@ -23,9 +23,23 @@ mqd_t mq_mission_req;
 mqd_t mq_mission_res;
 mqd_t mq_signal_control;
 
+Json::Value amr_seer_state;
+std::mutex mutex_seer_state;
+
 Mission_Response_Structure mission_response_save;
 std::mutex lock_mission_response_save;
 
+AMR_Hardware_Info_Structure amr_hardware;
+std::mutex mutex_amr_hardware;
+
+Mission_Active_Info_Structure mission_active = {0};
+std::mutex mutex_mission_active;
+
+SharedBlockAMRState* shm_amr_state = nullptr;
+int shm_amr_state_fd = -1;
+
+ROBOT_STATE robot_state = ROBOT_STATE_NONE;
+WORK_MODE amr_work_mode = MANUAL;
 
 void terminal_sig_callback(int) 
 { 
@@ -33,12 +47,169 @@ void terminal_sig_callback(int)
 
 }
 
+void cleanup() 
+{
+    if (shm_amr_state && shm_amr_state != MAP_FAILED) 
+        munmap(shm_amr_state, sizeof(SharedBlockAMRState));
+    if (shm_amr_state_fd >= 0) 
+        close(shm_amr_state_fd);
+    std::cout << "cleanup done (shm kept)\n";
+}
+
+bool wait_and_attach_amr_state() 
+{
+    while (running) 
+    {
+        shm_amr_state_fd = shm_open(SHM_AMR_STATE_NAME, O_RDWR, 0666);
+        if (shm_amr_state_fd < 0) 
+        {
+            std::cerr << "waiting for SHM (writer)...\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        // check size
+        struct stat st;
+        if (fstat(shm_amr_state_fd, &st) != 0) 
+        { 
+            perror("fstat"); 
+            close(shm_amr_state_fd); 
+            shm_amr_state_fd = -1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        if (st.st_size < sizeof(SharedBlockAMRState)) 
+        {
+            std::cerr << "SHM exists but not sized yet, wait...\n";
+            close(shm_amr_state_fd);
+            shm_amr_state_fd = -1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        shm_amr_state = (SharedBlockAMRState*)mmap(nullptr, sizeof(SharedBlockAMRState),
+                                                        PROT_READ | PROT_WRITE, MAP_SHARED, shm_amr_state_fd, 0);
+        if (shm_amr_state == MAP_FAILED) 
+        { 
+            perror("mmap"); 
+            close(shm_amr_state_fd); 
+            shm_amr_state_fd = -1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        // wait until writer sets magic
+        while (running && shm_amr_state->magic != SHM_AMR_STATE_MAGIC) 
+        {
+            std::cerr << "SHM present but not initialized. waiting...\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
+        std::cout << "attached shm amr state(version=" << shm_amr_state->version << ")\n";
+        return true;
+    }
+    return false;
+}
+
+void thread_read_state_amr_func()
+{
+    while (true)
+    {
+        /* code */
+        // acquire rc_mutex
+        int r;
+        r = pthread_mutex_lock(&shm_amr_state->rw_mutex);
+        if (r == EOWNERDEAD) 
+        {
+            std::cerr << "shm amr state EOWNERDEAD on rw_mutex, recovering...\n";
+            pthread_mutex_consistent(&shm_amr_state->rw_mutex); 
+        }
+        AMR_State_Structure p;
+        memcpy(&p,shm_amr_state->data,sizeof(AMR_State_Structure));
+        pthread_mutex_unlock(&shm_amr_state->rw_mutex);
+        //
+        {
+            std::lock_guard<std::mutex> lock(mutex_seer_state);
+            Json::Value root;
+            Json::CharReaderBuilder reader;
+            std::string errs;
+            std::string seer_json(p.seer_state,strnlen(p.seer_state, SEER_STATE_SIZE));
+            std::istringstream ss(seer_json);
+            bool ok = Json::parseFromStream(reader, ss, &root, &errs);
+            if (!ok || !root.isObject()) 
+            {
+                std::cerr << "Parse error: " << errs << std::endl;
+            }
+            else
+            {
+                amr_seer_state["valid"] = true;
+                amr_seer_state["state"] = root;
+            }
+        }
+
+        robot_state = p.robot_state;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_mission_active);
+            robot_state = p.robot_state;
+            mission_active.mission_code = p.mission_active_info.mission_code;
+            mission_active.action_index = p.mission_active_info.action_index;
+            mission_active.mission_state = p.mission_active_info.mission_state;
+            mission_active.mission_error_code = p.mission_active_info.mission_error_code;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_amr_hardware);
+            amr_hardware.lift_state = p.lift_state;
+            amr_hardware.comidity_state = p.commodity_state;
+        }
+        // std::cout << "1\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 void http_server_init()
 {
     /* init http server */
+    http_server.Post("/work_mode", [](const httplib::Request& req, httplib::Response& res) {
+        std::cout << "raw data : " << req.body << "\n";
+        std::istringstream ss(req.body);
+        Json::CharReaderBuilder rbuilder;
+        Json::Value root;
+        std::string errs;
+        std::cout << "send work mode\n";
+        if (!Json::parseFromStream(rbuilder, ss, &root, &errs)) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
+            return;
+        }
+        
+        if (!root["work_mode"].isBool() || robot_state != ROBOT_STATE_IDLE) 
+        {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing or invalid key: work_mode\"}", "application/json");
+            return;
+        }
+
+        amr_work_mode = (WORK_MODE)root["work_mode"].asBool();
+
+        Json::Value reply;
+        reply["response"] = 0;
+        Json::StreamWriterBuilder writer;
+        res.status = 200;
+        res.set_content(Json::writeString(writer, reply), "application/json");
+    });
+
     // POST /cancel  --> receive JSON, return JSON
     http_server.Post("/cancel", [](const httplib::Request& req, httplib::Response& res) {
         std::cout << "send cancel\n";
+
+        if (robot_state == ROBOT_STATE_IDLE) 
+        {
+            res.status = 400;
+            res.set_content("{\"error\":\"robot idle\"}", "application/json");
+            return;
+        }
         
         AMR_Signal_Control_Structure amr_signal_control = {0};
         amr_signal_control.signal_mission.signal_cancel = true;
@@ -63,6 +234,13 @@ void http_server_init()
     // POST /resume  --> receive JSON, return JSON
     http_server.Post("/resume", [](const httplib::Request& req, httplib::Response& res) {
         std::cout << "send resume\n";
+
+        if (robot_state == ROBOT_STATE_IDLE) 
+        {
+            res.status = 400;
+            res.set_content("{\"error\":\"robot idle\"}", "application/json");
+            return;
+        }
         
         AMR_Signal_Control_Structure amr_signal_control = {0};
         amr_signal_control.signal_mission.signal_resume_manual = true;
@@ -87,6 +265,13 @@ void http_server_init()
     // POST /pause  --> receive JSON, return JSON
     http_server.Post("/pause", [](const httplib::Request& req, httplib::Response& res) {
         std::cout << "send pause\n";
+
+        if (robot_state == ROBOT_STATE_IDLE) 
+        {
+            res.status = 400;
+            res.set_content("{\"error\":\"robot idle\"}", "application/json");
+            return;
+        }
         
         AMR_Signal_Control_Structure amr_signal_control = {0};
         amr_signal_control.signal_mission.signal_pause_manual = true;
@@ -116,14 +301,14 @@ void http_server_init()
         Json::Value root_recv;
         std::string errs;
         bool check_json = Json::parseFromStream(rbuilder, ss, &root_recv, &errs);
-        if (!check_json || !root_recv.isObject()) 
+        if (!check_json || !root_recv.isObject() || robot_state == ROBOT_STATE_IDLE) 
         {
             res.status = 400;
             res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
             return;
         }
         
-        if(!root_recv["level"].isBool())
+        if(!root_recv["level"].isBool() || robot_state == ROBOT_STATE_IDLE || amr_work_mode == MANUAL)
         {
             res.status = 400;
             res.set_content("{\"error\":\"missing or invalid key: lift or robot is not idle or robot is auto\"}", "application/json");
@@ -172,7 +357,8 @@ void http_server_init()
             return;
         }
         
-        if(!root_recv["x"].isDouble() || !root_recv["y"].isDouble() || !root_recv["angle"].isDouble() || !root_recv["length"].isDouble())
+        if(!root_recv["x"].isDouble() || !root_recv["y"].isDouble() || !root_recv["angle"].isDouble() || !root_recv["length"].isDouble()
+            || robot_state == ROBOT_STATE_IDLE || amr_work_mode == MANUAL)
         {
             res.status = 400;
             res.set_content("{\"error\":\"missing or invalid key or robot is not idle or robot is auto\"}", "application/json");
@@ -291,11 +477,60 @@ void http_server_init()
         res.status = 200;
         res.set_content(Json::writeString(writer, reply), "application/json");
     });
+
+    http_server.Get("/status", [](const httplib::Request& req, httplib::Response& res) {
+        Json::Value root;
+        {
+            std::lock_guard<std::mutex> lock(mutex_seer_state);
+            if(amr_seer_state["valid"].asBool())
+            {
+                root["seer"] = amr_seer_state["state"];
+            }
+            else
+            {
+                root["seer"] = Json::nullValue;
+            }
+        }
+
+        {
+            Json::Value mission_active_json;
+            std::lock_guard<std::mutex> lock(mutex_mission_active);
+            mission_active_json["action_index"] = mission_active.action_index;
+            mission_active_json["mission_code"] = mission_active.mission_code;
+            mission_active_json["mission_error_code"] = mission_active.mission_error_code;
+            mission_active_json["mission_state"] = mission_active.mission_state;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_amr_hardware);
+            root["lift"] = amr_hardware.lift_state;
+            root["commodity"] = amr_hardware.comidity_state;
+        }
+        root["robot_state"] = robot_state;
+
+        root["work_mode"] = (bool)amr_work_mode;
+
+        Json::StreamWriterBuilder writer;
+        res.set_content(Json::writeString(writer, root), "application/json");
+    });
 }
 
 int main(int argc,char *argv[])
 {
     bool check_mq = false;
+
+    amr_seer_state["seer_state"] = Json::nullValue;
+    amr_seer_state["valid"] = false;
+
+    mission_active.action_index = -1;
+    mission_active.mission_code = -1;
+    mission_active.mission_error_code = MISSION_ERROR_NONE;
+    mission_active.mission_state = MISSION_STATE_NONE;
+
+    amr_hardware.comidity_state = COMMODITY_NONE;
+    amr_hardware.determine_point = "";
+    amr_hardware.lift_state = LIFT_NONE;
+
     signal(SIGINT, terminal_sig_callback);
     signal(SIGTERM, terminal_sig_callback);
 
@@ -369,8 +604,18 @@ int main(int argc,char *argv[])
     std::cout << "Connected to Message Queue Signal Control\n";
     /*---------------------------------------------------------*/
     
+    /*--------Shared memory----------*/
+    if (!wait_and_attach_amr_state())
+    {
+        /* code */
+        return 1;
+    }
+    /*-------------------------------*/
 
     http_server_init();
+
+    std::thread thread_read_state_amr(thread_read_state_amr_func);
+    thread_read_state_amr.detach();
 
     http_server.new_task_queue = [] { return new httplib::ThreadPool(4); };
     std::thread http_server_thread([&]() {
@@ -418,6 +663,8 @@ int main(int argc,char *argv[])
 
     mq_close(mq_mission_res);
     mq_unlink(MQ_MISSION_RES);
+
+    cleanup();
 
     return 0;
 }

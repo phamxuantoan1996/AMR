@@ -86,6 +86,15 @@ struct AMR_Signal_Control_Structure
     Mission_Control_Signal_Structure signal_mission;
 };
 
+struct AMR_Hardware_Info_Structure
+{
+    /* data */
+    COMMODITY_STATE comidity_state;
+    LIFT_LEVEL lift_state;
+    std::string determine_point;
+};
+
+
 struct Mission_Active_Info_Structure
 {
     /* data */
@@ -103,6 +112,16 @@ struct AMR_State_Structure
     LIFT_LEVEL lift_state;
     ROBOT_STATE robot_state;
     Mission_Active_Info_Structure mission_active_info;
+};
+
+struct SharedBlockAMRState {
+    uint64_t magic;     // == SHM_MAGIC when fully initialized
+    pthread_mutex_t   rw_mutex;   // unnamed semaphore: protects writer vs readers (1 = free)
+    pthread_mutex_t   rc_mutex;   // unnamed semaphore: protects read_count
+    uint64_t version;   // incremented by writer each restart (optional)
+    int32_t  read_count;
+    uint32_t len;
+    char data[AMR_STATUS_MAX_PAYLOAD];
 };
 
 

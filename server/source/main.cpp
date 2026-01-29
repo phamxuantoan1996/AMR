@@ -16,6 +16,12 @@
 
 #include <common.h>
 
+#include <fstream>
+#include <ctime>
+#include <iomanip>
+#include <filesystem>
+#include <exception>
+
 std::atomic<bool> running{true};
 httplib::Server http_server;
 
@@ -40,6 +46,42 @@ int shm_amr_state_fd = -1;
 
 ROBOT_STATE robot_state = ROBOT_STATE_NONE;
 WORK_MODE amr_work_mode = MANUAL;
+
+void ensure_log_dir(const std::string& path) {
+    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+        throw std::runtime_error("Cannot create log directory");
+    }
+}
+
+void log_json(const std::string& json_str) {
+    try {
+        const std::string log_dir = "/home/esatech/log";
+        ensure_log_dir(log_dir);
+
+        std::time_t now = std::time(nullptr);
+        std::tm tm_now{};
+        localtime_r(&now, &tm_now);
+
+        std::ostringstream file_name;
+        file_name << log_dir << "/"
+                  << std::put_time(&tm_now, "%Y-%m-%d")
+                  << ".log";
+
+        std::ostringstream timestamp;
+        timestamp << std::put_time(&tm_now, "%Y-%m-%d %H:%M:%S");
+
+        std::ofstream log_file(file_name.str(), std::ios::app);
+        if (!log_file.is_open()) {
+            throw std::runtime_error("Cannot open log file");
+        }
+
+        log_file << "[" << timestamp.str() << "] : "
+                 << json_str << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[LOG ERROR] " << e.what() << std::endl;
+    }
+}
 
 void terminal_sig_callback(int) 
 { 

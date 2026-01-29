@@ -301,14 +301,14 @@ void http_server_init()
         Json::Value root_recv;
         std::string errs;
         bool check_json = Json::parseFromStream(rbuilder, ss, &root_recv, &errs);
-        if (!check_json || !root_recv.isObject() || robot_state == ROBOT_STATE_IDLE) 
+        if (!check_json || !root_recv.isObject()) 
         {
             res.status = 400;
             res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
             return;
         }
         
-        if(!root_recv["level"].isBool() || robot_state == ROBOT_STATE_IDLE || amr_work_mode == MANUAL)
+        if(!root_recv["level"].isBool() || robot_state != ROBOT_STATE_IDLE || amr_work_mode != MANUAL)
         {
             res.status = 400;
             res.set_content("{\"error\":\"missing or invalid key: lift or robot is not idle or robot is auto\"}", "application/json");
@@ -358,7 +358,7 @@ void http_server_init()
         }
         
         if(!root_recv["x"].isDouble() || !root_recv["y"].isDouble() || !root_recv["angle"].isDouble() || !root_recv["length"].isDouble()
-            || robot_state == ROBOT_STATE_IDLE || amr_work_mode == MANUAL)
+            || robot_state != ROBOT_STATE_IDLE || amr_work_mode != MANUAL)
         {
             res.status = 400;
             res.set_content("{\"error\":\"missing or invalid key or robot is not idle or robot is auto\"}", "application/json");
@@ -390,7 +390,7 @@ void http_server_init()
     });
 
     // POST /dispatch_mission  --> receive JSON, return JSON
-    http_server.Post("/dispatch_mission", [](const httplib::Request& req, httplib::Response& res) {
+    http_server.Post("/dispatch", [](const httplib::Request& req, httplib::Response& res) {
         std::istringstream ss(req.body);
         Json::CharReaderBuilder rbuilder;
         Json::Value root_recv;
@@ -404,53 +404,112 @@ void http_server_init()
             return;
         }
 
-        if(!root_recv["mission_code"].isInt() || !root_recv["mission_type"].isBool() || !root_recv["mission_details"].isArray())
+        bool check_mission = false;
+        int16_t count = 0;
+        int16_t index_pick = -1;
+        int16_t index_put = -1;
+
+        if(root_recv["mission_type"].isBool() && root_recv["mission_code"].isInt() && root_recv["mission_details"].isArray())
+        {
+            bool check_action = true;
+            for(const auto &item : root_recv["mission_details"])
+            {
+                if (item["action_name"].isString())
+                {
+                    /* code */
+                    if(item["action_name"].asString() == "pick" || item["action_name"].asString() == "put" || item["action_name"].asString() == "navigation")
+                    {
+                        if(item["action_name"].asString() == "pick")
+                        {
+                            if(index_pick == -1)
+                            {
+                                index_pick = count;
+                            }
+                            if(item["qr_code"].isInt() && item["point_out1"].isString() && item["point_in"].isString() && item["point_out2"].isString())
+                            {
+                                std::cout << "--------ok pick\n";
+                                continue;
+                            }
+                            else
+                            {
+                                std::cout << "--------error pick\n";
+                            }
+                        }
+                        else if(item["action_name"].asString() == "put")
+                        {
+                            if(index_put == -1)
+                            {
+                                index_put = count;
+                            }
+                            if(item["point_out1"].isString() && item["point_in"].isString() && item["point_out2"].isString())
+                            {
+                                std::cout << "-------ok put\n";
+                                continue;
+                            }
+                            else
+                            {
+                                std::cout << "-------error put\n";
+                            }
+                        }
+                        else if(item["action_name"].asString() == "navigation")
+                        {
+                            if(item["target_point"].isString())
+                            {
+                                continue;
+                            }
+                            else
+                            {
+                                std::cout << "--------error nav\n";
+                            }
+                        }
+                    }
+                }
+                std::cout << "--------error " << item["action_name"].asString() << "\n";
+                check_action = false;
+                count++;
+            }
+            if(check_action)
+            {
+                
+                check_mission = true;
+            }
+        }
+
+        COMMODITY_STATE comidity;
+        LIFT_LEVEL lift_state;
+        {
+            std::lock_guard<std::mutex> lock(mutex_amr_hardware);
+            comidity = amr_hardware.comidity_state;
+            lift_state = amr_hardware.lift_state;
+        }
+        
+        if(comidity == COMMODITY_AVAI)
+        {
+            std::cout << "commodity available----------\n";
+            if((index_put == -1 && index_pick >= 0) || (index_pick >= 0 && index_put >= 0 && index_pick < index_put))
+            {
+                check_mission = false;
+            }
+        }
+
+        if(!check_mission)
         {
             res.status = 400;
-            res.set_content("{\"error\":\"Key invalid!\"}", "application/json");
+            res.set_content("{\"error\":\"missing or invalid key\"}", "application/json");
             return;
         }
 
-        check = true;
-        for(auto item : root_recv["mission_details"])
-        {
-            if(item["action_name"].isString())
-            {
-                if(item["action_name"].asString() == "pick")
-                {
-                    if (item["point_in"].isString() && item["point_out1"].isString() && item["point_out2"].isString() && item["qr_code"].isInt())
-                    {
-                        /* code */
-                        continue;
-                    }
-                    
-                }
-                else if(item["action_name"].asString() == "put")
-                {
-                    if (item["point_in"].isString() && item["point_out1"].isString() && item["point_out2"].isString())
-                    {
-                        /* code */
-                        continue;
-                    }
-                }
-                else if(item["action_name"].asString() == "navigation")
-                {
-                    if (item["target_point"].isString())
-                    {
-                        /* code */
-                        continue;
-                    }
-                }
-            }
-            check = false;
-        }
+        std::cout << "robot state : " << (int)robot_state << std::endl;
 
         Json::StreamWriterBuilder writer;
+        MISSION_CONFIRM_TYPE mission_confirm;
         Json::Value reply;
-        std::lock_guard<std::mutex> lock(lock_mission_response_save);
-        if (check && mission_response_save.mission_confirm != MISSION_CONFIRM_RUN)
         {
-            /* code */
+            std::lock_guard<std::mutex> lock(lock_mission_response_save);
+            mission_confirm = mission_response_save.mission_confirm;
+        }
+        if(robot_state == ROBOT_STATE_IDLE && mission_confirm != MISSION_CONFIRM_RUN && root_recv["mission_type"].asBool() == amr_work_mode && lift_state == LIFT_LEVEL_0)
+        {
             std::string mission_details_string = Json::writeString(writer,root_recv["mission_details"]);
             Mission_Request_Structure mission_req;
             mission_req.mission_code = root_recv["mission_code"].asInt();
@@ -474,6 +533,7 @@ void http_server_init()
         {
             reply["response"] = 1;
         }
+
         res.status = 200;
         res.set_content(Json::writeString(writer, reply), "application/json");
     });
@@ -499,6 +559,7 @@ void http_server_init()
             mission_active_json["mission_code"] = mission_active.mission_code;
             mission_active_json["mission_error_code"] = mission_active.mission_error_code;
             mission_active_json["mission_state"] = mission_active.mission_state;
+            root["mission"] = mission_active_json;
         }
 
         {

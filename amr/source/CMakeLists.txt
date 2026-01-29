@@ -25,4 +25,4 @@ pkg_check_modules(JSONCPP jsoncpp)
 link_libraries(${JSONCPP_LIBRARIES})
 
 # link thread
-target_link_libraries(amr PUBLIC rt Threads::Threads ${JSONCPP_LIBRARIES})
+target_link_libraries(amr PUBLIC rt Threads::Threads ${JSONCPP_LIBRARIES} ${LIBRARY_DIR}/libseercontroller.a)
